@@ -1,0 +1,18 @@
+#!/bin/zsh
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SHIM="$ROOT/.build-toolchain/package-description-shim.o"
+REAL=/Library/Developer/CommandLineTools/usr/bin/swiftc
+
+is_manifest=0
+for arg in "$@"; do
+  if [[ "$arg" == "-package-description-version" ]]; then
+    is_manifest=1
+    break
+  fi
+done
+
+if [[ $is_manifest -eq 1 && -f "$SHIM" ]]; then
+  exec "$REAL" "$@" "$SHIM"
+fi
+exec "$REAL" "$@"
