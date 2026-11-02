@@ -45,9 +45,19 @@ struct BrandLogo: View {
 }
 
 enum BrandAppearance {
+    /// The Dock needs the icon-grid version with its transparent margin;
+    /// `AppLogo` is full-bleed and would fill the whole Dock slot.
+    static let dockIcon: NSImage? = {
+        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+        return NSImage(named: "AppIcon")
+    }()
+
     @MainActor
     static func applyAppIcon() {
-        if let image = BrandLogo.image {
+        if let image = dockIcon {
             NSApp.applicationIconImage = image
         }
     }
