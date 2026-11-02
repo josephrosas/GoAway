@@ -14,6 +14,7 @@ enum AppDefaults {
     static let appearance = "goaway.appearance"
     static let scrubFreeSpace = "goaway.scrubFreeSpace"
     static let showAssuranceWarnings = "goaway.showAssuranceWarnings"
+    static let confirmBeforeErasing = "goaway.confirmBeforeErasing"
 
     static func bool(forKey key: String, default defaultValue: Bool) -> Bool {
         let defaults = UserDefaults.standard

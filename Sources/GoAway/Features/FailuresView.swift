@@ -48,6 +48,7 @@ struct FailuresView: View {
         }
         .padding(.horizontal, 12)
         .frame(height: WipeLayout.failureRow)
+        .help(failure.message)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(failure.path.lastPathComponent), \(failure.kind.reason)")
     }

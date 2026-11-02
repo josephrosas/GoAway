@@ -32,10 +32,13 @@ public struct VolumeClass: Sendable, Equatable, Hashable {
         self.isReadOnly = isReadOnly
     }
 
-    /// APFS is copy-on-write: overwriting a file allocates fresh blocks and frees
-    /// the old ones, so in-place overwrite is only real on other local filesystems.
+    /// Overwrites land on the file's own blocks on every local filesystem
+    /// (`GoAwayCheck --forensic` confirms it for APFS, HFS+ and exFAT). APFS
+    /// copies on write only blocks shared with a snapshot or a clone; the
+    /// snapshot warning covers the first, and a clone outside Trash still holds
+    /// its own copy anyway. A network server decides for itself.
     public var inPlaceOverwrite: Bool {
-        !isNetwork && filesystem.lowercased() != "apfs"
+        !isNetwork
     }
 
     public var displayName: String {
@@ -207,5 +210,12 @@ public enum VolumeSpace {
         var fs = statfs()
         guard path.withCString({ statfs($0, &fs) == 0 }) else { return 0 }
         return Int64(fs.f_bavail) * Int64(fs.f_bsize)
+    }
+
+    /// Total size of the volume holding `path` (the whole container on APFS).
+    public static func capacity(at path: String) -> Int64 {
+        var fs = statfs()
+        guard path.withCString({ statfs($0, &fs) == 0 }) else { return 0 }
+        return Int64(fs.f_blocks) * Int64(fs.f_bsize)
     }
 }

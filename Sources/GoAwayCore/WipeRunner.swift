@@ -77,68 +77,69 @@ public enum WipeRunner {
         }
         let volumes = items.indices.map { volume(for: $0) }
 
+        // Leaves (files, symlinks) first, directories after; both already deepest-first.
+        let leafIndices = items.indices.filter { items[$0].kind != .directory }
+        let directoryIndices = items.indices.filter { items[$0].kind == .directory }
+
         let state = RunState(
             progress: progress,
             snapshot: WipeProgress(
                 phaseLabel: "Erasing",
                 itemsTotal: items.count,
                 bytesTotal: plannedBytes(items: items, volumes: volumes, request: request),
-                passLabel: passLabel(for: rootVolumes.first ?? .unknown, request: request)
+                passLabel: passLabel(for: leafIndices.map { volumes[$0] }, request: request)
             )
         )
         state.emit(force: true)
 
-        // Leaves (files, symlinks) first, directories after; both already deepest-first.
-        let leafIndices = items.indices.filter { items[$0].kind != .directory }
-        let directoryIndices = items.indices.filter { items[$0].kind == .directory }
+        let shouldStop: @Sendable () -> Bool = { cancel.isCancelled }
 
-        let parallelOK = !rootVolumes.isEmpty && rootVolumes.allSatisfy { $0.isSolidState && !$0.isNetwork }
-        let workers = parallelOK && leafIndices.count > 1
-            ? min(maxWorkers, max(1, ProcessInfo.processInfo.activeProcessorCount))
-            : 1
+        /// Erases one item; false when cancellation stopped it part-way, in
+        /// which case it stays in Trash and counts as remaining.
+        @Sendable func process(_ index: Int, buffer: AlignedBuffer?) -> Bool {
+            let item = items[index]
+            state.itemStarted(name: item.url.lastPathComponent)
+            do {
+                try erase(
+                    item,
+                    volume: volumes[index],
+                    request: request,
+                    guardrail: guardrail,
+                    buffer: buffer,
+                    shouldStop: shouldStop
+                ) { delta in
+                    state.addBytes(delta)
+                }
+                state.itemFinished(failure: nil)
+            } catch SecureEraserError.cancelled {
+                return false
+            } catch {
+                state.itemFinished(failure: WipeFailure(
+                    path: item.url.path,
+                    message: error.localizedDescription,
+                    kind: FailureKind.classify(error)
+                ))
+            }
+            return true
+        }
 
-        let queue = WorkQueue(indices: leafIndices)
-        DispatchQueue.concurrentPerform(iterations: workers) { _ in
-            let buffer = AlignedBuffer(count: SecureEraser.chunkSize)
-            while !cancel.isCancelled, let index = queue.next() {
-                let item = items[index]
-                state.itemStarted(name: item.url.lastPathComponent)
-                do {
-                    try erase(
-                        item,
-                        volume: volumes[index],
-                        request: request,
-                        guardrail: guardrail,
-                        buffer: buffer
-                    ) { delta in
-                        state.addBytes(delta)
-                    }
-                    state.itemFinished(failure: nil)
-                } catch {
-                    state.itemFinished(failure: WipeFailure(
-                        path: item.url.path,
-                        message: error.localizedDescription,
-                        kind: FailureKind.classify(error)
-                    ))
+        // One lane set per volume, so a hard drive's single worker runs
+        // alongside an SSD's parallel ones instead of serializing everything.
+        let lanes = workLanes(for: leafIndices, volumes: volumes)
+        let laneGroup = DispatchGroup()
+        for queue in lanes {
+            DispatchQueue.global(qos: .userInitiated).async(group: laneGroup) {
+                let buffer = AlignedBuffer(count: SecureEraser.chunkSize)
+                while !cancel.isCancelled, let index = queue.next() {
+                    if !process(index, buffer: buffer) { break }
                 }
             }
         }
+        laneGroup.wait()
 
         if !cancel.isCancelled {
             for index in directoryIndices {
-                if cancel.isCancelled { break }
-                let item = items[index]
-                state.itemStarted(name: item.url.lastPathComponent)
-                do {
-                    try erase(item, volume: volumes[index], request: request, guardrail: guardrail)
-                    state.itemFinished(failure: nil)
-                } catch {
-                    state.itemFinished(failure: WipeFailure(
-                        path: item.url.path,
-                        message: error.localizedDescription,
-                        kind: FailureKind.classify(error)
-                    ))
-                }
+                if cancel.isCancelled || !process(index, buffer: nil) { break }
             }
         }
 
@@ -157,51 +158,26 @@ public enum WipeRunner {
             )
         }
 
-        // Snapshot / FileVault / Time Machine probes overlap with the scrub.
+        // Snapshots are listed before the scrub: blocks they hold are out of the
+        // scrub's reach until the snapshot is deleted, which the report offers.
+        let inspector = request.inspector
+        var snapshots: [String: [String]] = [:]
+        for volume in distinctVolumes where !volume.isNetwork {
+            snapshots[volume.mountPoint] = inspector.localSnapshots(mountPoint: volume.mountPoint)
+        }
+
+        // FileVault / Time Machine probes overlap with the scrub.
         let inspection = InspectionBox()
         let group = DispatchGroup()
         group.enter()
         DispatchQueue.global(qos: .utility).async {
-            let inspector = request.inspector
-            var snapshots: [String: [String]] = [:]
-            for volume in distinctVolumes where !volume.isNetwork {
-                snapshots[volume.mountPoint] = inspector.localSnapshots(mountPoint: volume.mountPoint)
-            }
-            inspection.set(
-                snapshots: snapshots,
-                timeMachine: inspector.isTimeMachineConfigured(),
-                fileVault: inspector.isFileVaultOn()
-            )
+            inspection.set(timeMachine: inspector.isTimeMachineConfigured(), fileVault: inspector.isFileVaultOn())
             group.leave()
         }
 
-        var scrubbed: [String: Int64] = [:]
-        var scrubFailures: [WipeFailure] = []
-        var scrubCancelled = false
-        if request.scrubFreeSpace {
-            for volume in distinctVolumes where !volume.isNetwork && !volume.isReadOnly {
-                if cancel.isCancelled { scrubCancelled = true; break }
-                guard let rootIndex = rootVolumes.firstIndex(of: volume) else { continue }
-                let root = request.roots[rootIndex]
-                state.beginScrub(volumeName: volume.displayName)
-                do {
-                    let outcome = try FreeSpaceScrubber.scrub(inside: root, cancel: cancel) { written, planned in
-                        state.scrubProgress(written: written, planned: planned)
-                    }
-                    if outcome.cancelled {
-                        scrubCancelled = true
-                        break
-                    }
-                    scrubbed[volume.mountPoint] = outcome.bytesWritten
-                } catch {
-                    scrubFailures.append(WipeFailure(
-                        path: root.path,
-                        message: error.localizedDescription,
-                        kind: .scrub
-                    ))
-                }
-            }
-        }
+        let scrub = request.scrubFreeSpace
+            ? scrubVolumes(distinctVolumes, request: request, rootVolumes: rootVolumes, cancel: cancel, state: state)
+            : ScrubReport()
 
         fullSync(volumes: distinctVolumes, roots: request.roots)
         group.wait()
@@ -211,9 +187,9 @@ public enum WipeRunner {
             VolumeAssurance(
                 volume: volume,
                 inPlaceOverwrite: volume.inPlaceOverwrite,
-                freeSpaceScrubbed: scrubbed[volume.mountPoint] != nil,
-                scrubbedBytes: scrubbed[volume.mountPoint] ?? 0,
-                localSnapshots: facts.snapshots[volume.mountPoint] ?? [],
+                freeSpaceScrubbed: scrub.scrubbed[volume.mountPoint] != nil,
+                scrubbedBytes: scrub.scrubbed[volume.mountPoint] ?? 0,
+                localSnapshots: snapshots[volume.mountPoint] ?? [],
                 timeMachineConfigured: facts.timeMachine,
                 fileVaultOn: facts.fileVault
             )
@@ -221,19 +197,126 @@ public enum WipeRunner {
 
         state.emit(force: true)
         return WipeResult(
-            outcome: scrubCancelled ? .cancelled : .completed,
+            outcome: scrub.cancelled ? .cancelled : .completed,
             erasedCount: erased,
             remainingCount: 0,
-            failures: failures + scrubFailures,
+            failures: failures + scrub.failures,
             assurances: assurances
         )
     }
 
+    public struct ScrubReport: Sendable, Equatable {
+        /// Bytes written, by mount point, for every volume that finished.
+        public var scrubbed: [String: Int64] = [:]
+        public var failures: [WipeFailure] = []
+        public var cancelled = false
+
+        public init() {}
+    }
+
+    /// Scrubs free space without erasing anything, e.g. after local snapshots
+    /// were deleted and released blocks that still hold Trash data.
+    /// `mountPoints` limits the run to those volumes; nil means every root's volume.
+    public static func scrubOnly(
+        _ request: WipeRequest,
+        mountPoints: Set<String>? = nil,
+        cancel: CancelFlag,
+        progress: @escaping @Sendable (WipeProgress) -> Void
+    ) -> ScrubReport {
+        let rootVolumes = request.roots.map { request.probe.classify($0) }
+        let volumes = distinct(rootVolumes).filter { mountPoints?.contains($0.mountPoint) ?? true }
+        let state = RunState(progress: progress, snapshot: WipeProgress(phaseLabel: "Scrubbing free space"))
+        let report = scrubVolumes(volumes, request: request, rootVolumes: rootVolumes, cancel: cancel, state: state)
+        fullSync(volumes: volumes, roots: request.roots)
+        state.emit(force: true)
+        return report
+    }
+
+    private static func scrubVolumes(
+        _ volumes: [VolumeClass],
+        request: WipeRequest,
+        rootVolumes: [VolumeClass],
+        cancel: CancelFlag,
+        state: RunState
+    ) -> ScrubReport {
+        var report = ScrubReport()
+        for volume in volumes where !volume.isNetwork && !volume.isReadOnly {
+            if cancel.isCancelled { report.cancelled = true; break }
+            guard let rootIndex = rootVolumes.firstIndex(of: volume) else { continue }
+            let root = request.roots[rootIndex]
+            state.beginScrub(volumeName: volume.displayName)
+            do {
+                let headroom = request.scrubHeadroom ?? FreeSpaceScrubber.headroom(
+                    for: volume,
+                    capacity: VolumeSpace.capacity(at: root.path)
+                )
+                let outcome = try FreeSpaceScrubber.scrub(inside: root, headroom: headroom, cancel: cancel) { written, planned in
+                    state.scrubProgress(written: written, planned: planned)
+                }
+                if outcome.cancelled {
+                    report.cancelled = true
+                    break
+                }
+                report.scrubbed[volume.mountPoint] = outcome.bytesWritten
+            } catch {
+                report.failures.append(WipeFailure(
+                    path: root.path,
+                    message: error.localizedDescription,
+                    kind: .scrub
+                ))
+            }
+        }
+        return report
+    }
+
     public static func passLabel(for volume: VolumeClass, request: WipeRequest) -> String {
+        if volume.isNetwork {
+            return "unlink only (network)"
+        }
         if volume.isSolidState && request.respectSSD {
             return "1 pass (SSD)"
         }
         return request.level.title
+    }
+
+    /// The label shared by every volume being erased, or "mixed" when they differ.
+    public static func passLabel(for volumes: [VolumeClass], request: WipeRequest) -> String {
+        let labels = Set(volumes.map { passLabel(for: $0, request: request) })
+        if labels.count > 1 { return "mixed passes" }
+        return labels.first ?? passLabel(for: .unknown, request: request)
+    }
+
+    /// Workers per volume for the leaf phase, keyed by mount point: up to
+    /// `maxWorkers` on local SSDs and one elsewhere (seeks on a hard drive make
+    /// parallel writers slower, not faster).
+    public static func laneCounts(for indices: [Int], volumes: [VolumeClass]) -> [String: Int] {
+        let cores = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        var sizes: [String: Int] = [:]
+        var parallel: [String: Bool] = [:]
+        for index in indices {
+            let volume = volumes[index]
+            sizes[volume.mountPoint, default: 0] += 1
+            parallel[volume.mountPoint] = volume.isSolidState && !volume.isNetwork
+        }
+        return sizes.reduce(into: [:]) { counts, entry in
+            counts[entry.key] = parallel[entry.key] == true ? min(maxWorkers, cores, entry.value) : 1
+        }
+    }
+
+    /// One shared queue per volume, repeated once per lane.
+    static func workLanes(for indices: [Int], volumes: [VolumeClass]) -> [WorkQueue] {
+        let counts = laneCounts(for: indices, volumes: volumes)
+        var order: [String] = []
+        var grouped: [String: [Int]] = [:]
+        for index in indices {
+            let key = volumes[index].mountPoint
+            if grouped[key] == nil { order.append(key) }
+            grouped[key, default: []].append(index)
+        }
+        return order.flatMap { key -> [WorkQueue] in
+            let queue = WorkQueue(indices: grouped[key] ?? [])
+            return Array(repeating: queue, count: counts[key] ?? 1)
+        }
     }
 
     public static func erase(
@@ -242,6 +325,7 @@ public enum WipeRunner {
         request: WipeRequest,
         guardrail: PathGuard,
         buffer: AlignedBuffer? = nil,
+        shouldStop: (() -> Bool)? = nil,
         onBytes: ((Int) -> Void)? = nil
     ) throws {
         switch item.kind {
@@ -249,14 +333,26 @@ public enum WipeRunner {
             guard guardrail.allowsUnlink(item.url) else {
                 throw SecureEraserError.outsideTrash(item.url.path)
             }
-            try SecureEraser.unlink(item.url)
+            try SecureEraser.scrambleAndRemove(at: item.url, isDirectory: false, truncate: false) {
+                unlockForRemoval($0, guardrail: guardrail)
+            }
         case .directory:
             guard guardrail.allowsUnlink(item.url), !guardrail.isRoot(item.url) else {
                 throw SecureEraserError.outsideTrash(item.url.path)
             }
-            try SecureEraser.unlink(item.url)
+            try SecureEraser.scrambleAndRemove(at: item.url, isDirectory: true, truncate: false) {
+                unlockForRemoval($0, guardrail: guardrail)
+            }
         case .file:
-            try eraseFile(item, volume: volume, request: request, guardrail: guardrail, buffer: buffer, onBytes: onBytes)
+            try eraseFile(
+                item,
+                volume: volume,
+                request: request,
+                guardrail: guardrail,
+                buffer: buffer,
+                shouldStop: shouldStop,
+                onBytes: onBytes
+            )
         }
     }
 
@@ -282,14 +378,19 @@ public enum WipeRunner {
         request: WipeRequest,
         guardrail: PathGuard,
         buffer: AlignedBuffer?,
+        shouldStop: (() -> Bool)?,
         onBytes: ((Int) -> Void)?
     ) throws {
         guard guardrail.allowsUnlink(item.url) else {
             throw SecureEraserError.outsideTrash(item.url.path)
         }
 
+        // Dataless (iCloud) files would download if opened for writing, and
+        // truncating a hard link would destroy the other links' data.
         if item.isDataless || item.linkCount > 1 || volume.isNetwork {
-            try SecureEraser.unlink(item.url)
+            try SecureEraser.scrambleAndRemove(at: item.url, isDirectory: false, truncate: false) {
+                unlockForRemoval($0, guardrail: guardrail)
+            }
             return
         }
 
@@ -305,15 +406,38 @@ public enum WipeRunner {
             isSSD: volume.isSolidState,
             respectSSD: request.respectSSD
         )
-        try SecureEraser.overwriteContents(at: path, passes: passes, buffer: buffer, onBytes: onBytes)
+        do {
+            try SecureEraser.overwriteContents(
+                at: path, passes: passes, buffer: buffer, shouldStop: shouldStop, onBytes: onBytes
+            )
+        } catch {
+            // Read-only files (Git objects, Go module caches) and "deny write" ACLs.
+            guard FailureKind.classify(error) == .permission, SecureEraser.unlock(at: path) else { throw error }
+            try SecureEraser.overwriteContents(
+                at: path, passes: passes, buffer: buffer, shouldStop: shouldStop, onBytes: onBytes
+            )
+        }
 
         let resourceFork = SecureEraser.resourceForkPath(for: path)
         if FileManager.default.fileExists(atPath: resourceFork) {
             try? SecureEraser.overwriteContents(at: resourceFork, passes: passes, buffer: buffer)
         }
 
-        SecureEraser.removeExtendedAttributes(at: path)
-        _ = try SecureEraser.scrambleTruncateUnlink(at: item.url)
+        try SecureEraser.scrambleAndRemove(at: item.url, isDirectory: false, truncate: true) {
+            unlockForRemoval($0, guardrail: guardrail)
+        }
+    }
+
+    /// Unlocks an item and, when it sits below a Trash root, its parent folder:
+    /// removing an entry needs write access to the folder that holds it.
+    private static func unlockForRemoval(_ url: URL, guardrail: PathGuard) -> Bool {
+        guard guardrail.allowsUnlink(url) else { return false }
+        var changed = SecureEraser.unlock(at: url.path)
+        let parent = url.deletingLastPathComponent()
+        if guardrail.allowsUnlink(parent), !guardrail.isRoot(parent) {
+            changed = SecureEraser.unlock(at: parent.path) || changed
+        }
+        return changed
     }
 
     private static func distinct(_ volumes: [VolumeClass]) -> [VolumeClass] {
@@ -340,7 +464,7 @@ public enum WipeRunner {
 // MARK: - Shared state
 
 /// Hands out item indices to workers.
-private final class WorkQueue: @unchecked Sendable {
+final class WorkQueue: @unchecked Sendable {
     private let lock = NSLock()
     private let indices: [Int]
     private var cursor = 0
@@ -472,7 +596,6 @@ private final class RunState: @unchecked Sendable {
 
 private final class InspectionBox: @unchecked Sendable {
     struct Facts {
-        var snapshots: [String: [String]] = [:]
         var timeMachine = false
         var fileVault: Bool?
     }
@@ -480,9 +603,9 @@ private final class InspectionBox: @unchecked Sendable {
     private let lock = NSLock()
     private var facts = Facts()
 
-    func set(snapshots: [String: [String]], timeMachine: Bool, fileVault: Bool?) {
+    func set(timeMachine: Bool, fileVault: Bool?) {
         lock.lock()
-        facts = Facts(snapshots: snapshots, timeMachine: timeMachine, fileVault: fileVault)
+        facts = Facts(timeMachine: timeMachine, fileVault: fileVault)
         lock.unlock()
     }
 

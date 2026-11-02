@@ -17,9 +17,9 @@ struct AboutView: View {
             }
 
             LabeledContent("Version", value: appModel.versionText)
-            LabeledContent("Open", value: "Wipes Trash immediately")
+            LabeledContent("Open", value: "Wipes Trash immediately (hold Option to wait)")
 
-            Text("Overwriting helps against casual recovery. On SSDs and APFS, FileVault is the real protection — extra passes cannot reach every physical block.")
+            Text("Overwriting defeats recovery tools. On SSDs, FileVault is the real protection — extra passes cannot reach every physical block.")
                 .font(.caption)
                 .foregroundStyle(GoAwayTheme.muted)
 

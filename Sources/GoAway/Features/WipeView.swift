@@ -6,7 +6,9 @@ struct WipeRootView: View {
     @Environment(AppModel.self) private var appModel
 
     var body: some View {
-        Group {
+        // The window follows the content, so it only grows when there is a
+        // report worth reading.
+        AtLeastHeight(minHeight: 340) {
             switch appModel.phase {
             case .needsPermission:
                 PermissionView()
@@ -14,34 +16,30 @@ struct WipeRootView: View {
                 WipeView()
             }
         }
-        .frame(width: 420, height: windowHeight)
+        .frame(width: 420)
+        .fixedSize(horizontal: false, vertical: true)
         .background(GoAwayTheme.page)
         .preferredColorScheme(appModel.appearance.colorScheme)
         .background(WindowConfigurator(appearance: appModel.appearance))
-        .animation(.easeInOut(duration: 0.2), value: windowHeight)
         .onAppear {
             BrandAppearance.applyAppIcon()
-            appModel.startIfNeeded()
         }
     }
+}
 
-    /// The window only grows when there is a report worth reading.
-    private var windowHeight: CGFloat {
-        switch appModel.phase {
-        case .failed:
-            return 236 + WipeLayout.failuresHeight(count: appModel.result?.failures.count ?? 0) + reportHeight
-        case .done, .cancelled:
-            return 340 + reportHeight
-        case .needsPermission:
-            return appModel.permissionReason == nil ? 360 : 392
-        default:
-            return 340
-        }
+/// Takes the content's natural height but never less than `minHeight`, then
+/// lays the content out at that height so its spacers fill any extra room.
+struct AtLeastHeight: Layout {
+    var minHeight: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let natural = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+        return CGSize(width: proposal.width ?? natural.width, height: max(minHeight, natural.height))
     }
 
-    private var reportHeight: CGFloat {
-        guard !appModel.blockingWarnings.isEmpty, let result = appModel.result else { return 0 }
-        return WipeLayout.assuranceHeight(volumes: result.assurances.count, warnings: result.warnings.count)
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size))
     }
 }
 
@@ -52,14 +50,11 @@ enum WipeLayout {
     static func failuresHeight(count: Int) -> CGFloat {
         CGFloat(max(1, min(count, failureRowsShown))) * failureRow + 2
     }
-
-    static func assuranceHeight(volumes: Int, warnings: Int) -> CGFloat {
-        12 + CGFloat(volumes) * 40 + CGFloat(warnings) * 28 + 12
-    }
 }
 
 struct WipeView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(spacing: 18) {
@@ -79,7 +74,7 @@ struct WipeView: View {
                 FailuresView(failures: result.failures)
                     .frame(height: WipeLayout.failuresHeight(count: result.failures.count))
             } else {
-                ProgressRing(fraction: displayFraction, symbol: symbolName)
+                ProgressRing(fraction: displayFraction, symbol: symbolName, text: ringText)
                     .frame(width: 112, height: 112)
             }
 
@@ -117,6 +112,27 @@ struct WipeView: View {
                     appModel.cancel()
                 }
                 .keyboardShortcut(.cancelAction)
+            } else if appModel.phase == .ready {
+                HStack {
+                    SettingsLink {
+                        Text("Settings…")
+                    }
+                    Button("Erase Trash Now") {
+                        appModel.eraseTrashNow()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            } else if appModel.phase == .confirming {
+                HStack {
+                    Button("Cancel") {
+                        appModel.cancelCountdown()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Button("Erase Now") {
+                        appModel.eraseNow()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
             } else if appModel.phase == .failed {
                 HStack {
                     Button("Retry Failed") {
@@ -127,7 +143,7 @@ struct WipeView: View {
                         NSApplication.shared.terminate(nil)
                     }
                 }
-            } else if appModel.phase == .cancelled || !appModel.blockingWarnings.isEmpty {
+            } else if appModel.phase == .cancelled || appModel.holdsReportOpen {
                 Button("Close") {
                     NSApplication.shared.terminate(nil)
                 }
@@ -135,12 +151,22 @@ struct WipeView: View {
             }
         }
         .padding(24)
+        .onAppear {
+            if opensSettings(for: appModel.phase) { openSettings() }
+        }
+        .onChange(of: appModel.phase) { _, phase in
+            if opensSettings(for: phase) { openSettings() }
+        }
+    }
+
+    private func opensSettings(for phase: AppPhase) -> Bool {
+        phase == .ready && appModel.readyReason == .optionKey
     }
 
     private var showsAssurance: Bool {
         switch appModel.phase {
         case .done, .cancelled, .failed:
-            return !appModel.blockingWarnings.isEmpty
+            return appModel.holdsReportOpen
         default:
             return false
         }
@@ -152,6 +178,11 @@ struct WipeView: View {
             return 1
         case .checking, .scanning:
             return 0.05
+        case .ready:
+            return 0
+        case .confirming:
+            let total = Double(AppModel.countdownSeconds)
+            return (total - Double(appModel.countdownRemaining)) / total
         default:
             return appModel.progress.fraction
         }
@@ -162,16 +193,28 @@ struct WipeView: View {
         case .done, .empty: return "checkmark"
         case .cancelled: return "stop.fill"
         case .failed: return "exclamationmark"
+        case .ready: return "trash"
         default: return ""
         }
     }
 
+    private var ringText: String? {
+        appModel.phase == .confirming ? "\(appModel.countdownRemaining)" : nil
+    }
+
     private var subtitle: String {
         switch appModel.phase {
-        case .checking, .scanning: return "Looking through Trash…"
+        case .ready:
+            return appModel.readyReason == .optionKey ? "Option was held at launch" : "Waiting for you"
+        case .confirming: return "About to permanently erase Trash"
+        case .checking:
+            return appModel.erasingSelection ? "Erasing selected items" : "Starting…"
+        case .scanning:
+            return appModel.erasingSelection ? "Moving to Trash…" : "Looking through Trash…"
         case .wiping:
+            let what = appModel.erasingSelection ? "Permanently erasing selected items" : "Permanently erasing Trash"
             let label = appModel.progress.passLabel
-            return label.isEmpty ? "Permanently erasing Trash" : "Permanently erasing Trash · \(label)"
+            return label.isEmpty ? what : "\(what) · \(label)"
         case .scrubbing: return "Overwriting freed space"
         case .empty: return "Trash is already clear"
         case .done: return "Permanently erased"
@@ -183,8 +226,16 @@ struct WipeView: View {
 
     private var title: String {
         switch appModel.phase {
-        case .checking, .scanning:
-            return "Scanning Trash"
+        case .ready:
+            return "Nothing erased yet"
+        case .confirming:
+            let count = appModel.pendingItems.count
+            let items = count == 1 ? "1 item" : "\(count) items"
+            return "Erasing \(items) in \(appModel.countdownRemaining)…"
+        case .checking:
+            return appModel.erasingSelection ? "Waiting for confirmation" : "Getting ready"
+        case .scanning:
+            return appModel.erasingSelection ? "Getting ready" : "Scanning Trash"
         case .wiping:
             let count = appModel.progress.itemsTotal
             return count == 1 ? "Erasing 1 item" : "Erasing \(count) items"
@@ -207,6 +258,13 @@ struct WipeView: View {
 
     private var detail: String {
         switch appModel.phase {
+        case .ready:
+            return appModel.readyReason == .optionKey
+                ? "Adjust Settings if you like, then erase."
+                : "Erase Trash, or drop items on GoAway to erase just those."
+        case .confirming:
+            let bytes = appModel.pendingBytes
+            return bytes > 0 ? "\(bytes.formattedBytes) will be gone for good." : "They will be gone for good."
         case .wiping:
             return appModel.progress.currentName
         case .scrubbing:
@@ -269,6 +327,8 @@ struct WipeView: View {
 struct ProgressRing: View {
     var fraction: Double
     var symbol: String
+    /// Shown instead of the percentage, e.g. a countdown digit.
+    var text: String? = nil
 
     var body: some View {
         ZStack {
@@ -283,7 +343,13 @@ struct ProgressRing: View {
                 .rotationEffect(.degrees(-90))
                 .animation(.easeOut(duration: 0.2), value: fraction)
 
-            if symbol.isEmpty {
+            if let text {
+                Text(text)
+                    .font(.system(size: 34, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(GoAwayTheme.accentInk)
+                    .contentTransition(.numericText(countsDown: true))
+            } else if symbol.isEmpty {
                 Text("\(Int((fraction * 100).rounded()))%")
                     .font(.system(size: 22, weight: .semibold, design: .rounded))
                     .monospacedDigit()
@@ -293,6 +359,22 @@ struct ProgressRing: View {
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundStyle(GoAwayTheme.accentInk)
             }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Progress")
+        .accessibilityValue(spokenValue)
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    private var spokenValue: String {
+        if let text { return "Starting in \(text)" }
+        switch symbol {
+        case "": return "\(Int((fraction * 100).rounded())) percent"
+        case "checkmark": return "Finished"
+        case "stop.fill": return "Stopped"
+        case "exclamationmark": return "Finished with issues"
+        case "trash": return "Waiting"
+        default: return ""
         }
     }
 }
@@ -318,6 +400,7 @@ private struct WindowConfigurator: NSViewRepresentable {
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
         window.standardWindowButton(.zoomButton)?.isHidden = true
+        window.isRestorable = false
         window.appearance = appearance.nsAppearance
         window.backgroundColor = NSColor.textBackgroundColor
     }

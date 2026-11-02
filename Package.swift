@@ -8,7 +8,11 @@ let package = Package(
     ],
     products: [
         .executable(name: "GoAway", targets: ["GoAway"]),
+        .executable(name: "GoAwayProbe", targets: ["GoAwayProbe"]),
         .executable(name: "GoAwayCheck", targets: ["GoAwayCheck"])
+    ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0")
     ],
     targets: [
         .target(
@@ -22,7 +26,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "GoAway",
-            dependencies: ["GoAwayCore"],
+            dependencies: [
+                "GoAwayCore",
+                .product(name: "Sparkle", package: "Sparkle")
+            ],
             path: "Sources/GoAway",
             exclude: ["Assets"],
             linkerSettings: [
@@ -30,6 +37,11 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("DiskArbitration")
             ]
+        ),
+        .executableTarget(
+            name: "GoAwayProbe",
+            dependencies: ["GoAwayCore"],
+            path: "Sources/GoAwayProbe"
         ),
         .executableTarget(
             name: "GoAwayCheck",

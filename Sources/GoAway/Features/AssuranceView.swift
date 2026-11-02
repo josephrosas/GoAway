@@ -29,6 +29,18 @@ struct AssuranceView: View {
                 warningRow(warning)
             }
 
+            if !appModel.unscrubbedSnapshotSpace.isEmpty {
+                HStack(spacing: 8) {
+                    Text("The space the snapshots released still holds the old data.")
+                        .font(.caption)
+                    Spacer(minLength: 4)
+                    Button("Scrub Free Space") {
+                        appModel.scrubFreedSpace()
+                    }
+                    .controlSize(.small)
+                }
+            }
+
             if let message = appModel.snapshotActionMessage {
                 Text(message)
                     .font(.caption)

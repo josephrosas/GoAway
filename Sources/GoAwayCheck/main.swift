@@ -10,6 +10,16 @@ enum GoAwayCheck {
             Bench.run(arguments: Array(arguments.dropFirst()))
             return
         }
+        if arguments.first == "--forensic" {
+            do {
+                let findings = try Forensic.run()
+                Forensic.printReport(findings)
+                exit(findings.allSatisfy(\.passed) ? 0 : 1)
+            } catch {
+                fputs("forensic: setup failed: \(error)\n", stderr)
+                exit(2)
+            }
+        }
 
         do {
             try testPassCounts()
@@ -27,6 +37,13 @@ enum GoAwayCheck {
             try testCancelMidRun()
             try testRunItemsMatchesCollect()
             try testRetryFailedPath()
+            try testLockedItems()
+            try testScrubLeftovers()
+            try testCancelInsideFile()
+            try testSelectedItems()
+            try testWorkLanes()
+            try testScrubHeadroom()
+            try testStoredErrno()
             try testFailureKinds()
             try testSnapshotParser()
             try testAssuranceWarnings()
@@ -35,6 +52,7 @@ enum GoAwayCheck {
             try testPrivacyDenialClassification()
             try testPermissionProbes()
             try testCollectReportFlagsUnreadable()
+            try testForensic()
             print("GoAwayCheck: all passed")
         } catch {
             fputs("GoAwayCheck failed: \(error)\n", stderr)
@@ -165,7 +183,8 @@ enum GoAwayCheck {
         let leftover = try FileManager.default.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil)
         try expect(leftover.isEmpty, "trash empty")
         try expect(result.assurances.count == 1, "one assurance")
-        try expect(result.assurances[0].inPlaceOverwrite == false, "apfs not in place")
+        try expect(result.assurances[0].inPlaceOverwrite, "apfs overwrites in place")
+        try expect(result.assurances[0].summary.hasPrefix("overwritten in place"), "summary \(result.assurances[0].summary)")
         try expect(result.warnings.isEmpty, "no warnings")
     }
 
@@ -342,19 +361,16 @@ enum GoAwayCheck {
         try expect(leftover.isEmpty, "run(items:) empty")
     }
 
+    /// A file that appears in a folder after the scan must not be removed
+    /// unerased along with the folder. The folder fails, keeps its name, and a
+    /// retry over its subtree erases what is left.
     private static func testRetryFailedPath() throws {
-        if getuid() == 0 { return } // root ignores directory permissions
         let root = tempRoot("retry")
         let trash = root.appendingPathComponent("Trash", isDirectory: true)
-        let locked = trash.appendingPathComponent("locked", isDirectory: true)
-        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
-        let victim = locked.appendingPathComponent("stuck.txt")
-        try Data("stuck".utf8).write(to: victim)
-        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: locked.path)
-        defer {
-            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path)
-            try? FileManager.default.removeItem(at: root)
-        }
+        let folder = trash.appendingPathComponent("folder", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("scanned".utf8).write(to: folder.appendingPathComponent("scanned.txt"))
+        defer { try? FileManager.default.removeItem(at: root) }
 
         let request = WipeRequest(
             roots: [trash],
@@ -363,21 +379,219 @@ enum GoAwayCheck {
             probe: FixedVolumeProbe(solidState: true),
             inspector: quietInspector
         )
-        let first = WipeRunner.run(request, cancel: CancelFlag()) { _ in }
-        try expect(first.outcome == .completed && !first.failures.isEmpty, "first run has failures")
-        try expect(first.failures.contains { $0.kind == .permission }, "permission kind: \(first.failures.map(\.kind))")
+        let items = TrashEnumerator.collect(roots: [trash])
+        let late = folder.appendingPathComponent("late.txt")
+        try Data("late".utf8).write(to: late)
 
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path)
+        let first = WipeRunner.run(items: items, request: request, cancel: CancelFlag()) { _ in }
+        try expect(first.failures.count == 1, "folder fails: \(first.failures)")
+        let failedPath = first.failures.first.map { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path }
+        try expect(failedPath == folder.resolvingSymlinksInPath().path, "failure keeps original name: \(first.failures)")
+        try expect(FileManager.default.fileExists(atPath: folder.path), "failed folder still under its name")
+        try expect(FileManager.default.fileExists(atPath: late.path), "late file not dropped unerased")
+
         let guardrail = PathGuard(roots: [trash])
-        let retryItems = first.failures.compactMap { failure -> TrashItem? in
-            let url = URL(fileURLWithPath: failure.path)
-            guard guardrail.allowsUnlink(url) else { return nil }
-            return TrashEnumerator.makeItem(at: url)
+        let retryItems = first.failures.flatMap {
+            TrashEnumerator.collectSubtree(at: URL(fileURLWithPath: $0.path), guardrail: guardrail)
         }
+        try expect(retryItems.count == 2, "subtree has folder and late file: \(retryItems.count)")
         let second = WipeRunner.run(items: retryItems, request: request, cancel: CancelFlag()) { _ in }
         try expect(second.outcome == .completed && second.failures.isEmpty, "retry clean: \(second.failures)")
         let leftover = try FileManager.default.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil)
         try expect(leftover.isEmpty, "retry trash empty")
+    }
+
+    /// Read-only files in read-only folders (Git objects, Go module caches),
+    /// user-locked files and "deny delete" ACLs are erased, not reported.
+    private static func testLockedItems() throws {
+        if getuid() == 0 { return }
+        let root = tempRoot("locked")
+        let trash = root.appendingPathComponent("Trash", isDirectory: true)
+        let objects = trash.appendingPathComponent("repo/.git/objects/ab", isDirectory: true)
+        try FileManager.default.createDirectory(at: objects, withIntermediateDirectories: true)
+        let object = objects.appendingPathComponent("cdef0123")
+        try Data(repeating: 0x33, count: 8192).write(to: object)
+        chmod(object.path, 0o444)
+        chmod(objects.path, 0o555)
+
+        let flagged = trash.appendingPathComponent("locked.txt")
+        try Data("locked".utf8).write(to: flagged)
+        try expect(chflags(flagged.path, UInt32(UF_IMMUTABLE)) == 0, "set uchg")
+
+        let denied = trash.appendingPathComponent("acl.txt")
+        try Data("acl".utf8).write(to: denied)
+        let aclStatus = shell("/bin/chmod", ["+a", "everyone deny delete,write", denied.path])
+        defer {
+            _ = shell("/bin/chmod", ["-R", "-N", root.path])
+            _ = shell("/usr/bin/chflags", ["-R", "nouchg", root.path])
+            _ = shell("/bin/chmod", ["-R", "u+rwx", root.path])
+            try? FileManager.default.removeItem(at: root)
+        }
+        try expect(aclStatus == 0, "set ACL")
+
+        let request = WipeRequest(
+            roots: [trash],
+            level: .simple,
+            respectSSD: true,
+            probe: FixedVolumeProbe(solidState: true),
+            inspector: quietInspector
+        )
+        let result = WipeRunner.run(request, cancel: CancelFlag()) { _ in }
+        try expect(result.outcome == .completed && result.failures.isEmpty, "locked items erased: \(result.failures)")
+        let leftover = try FileManager.default.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil)
+        try expect(leftover.isEmpty, "locked trash empty: \(leftover.map(\.lastPathComponent))")
+    }
+
+    /// A scrub folder left by a killed run is deleted directly and never
+    /// enumerated for overwriting.
+    private static func testScrubLeftovers() throws {
+        let root = tempRoot("leftover")
+        let trash = root.appendingPathComponent("Trash", isDirectory: true)
+        let leftover = trash.appendingPathComponent(FreeSpaceScrubber.folderPrefix + "deadbeef", isDirectory: true)
+        try FileManager.default.createDirectory(at: leftover, withIntermediateDirectories: true)
+        try Data(count: 64 * 1024).write(to: leftover.appendingPathComponent("fill.bin"))
+        try Data("real".utf8).write(to: trash.appendingPathComponent("real.txt"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let items = TrashEnumerator.collect(roots: [trash])
+        try expect(items.map(\.url.lastPathComponent) == ["real.txt"], "scrub folder skipped: \(items.map(\.url.lastPathComponent))")
+
+        let released = FreeSpaceScrubber.removeLeftovers(in: [trash])
+        try expect(released == 64 * 1024, "released \(released)")
+        try expect(!FileManager.default.fileExists(atPath: leftover.path), "leftover removed")
+        try expect(FileManager.default.fileExists(atPath: trash.appendingPathComponent("real.txt").path), "real item untouched")
+    }
+
+    /// Cancel stops inside a large file instead of finishing it; the file
+    /// stays in Trash and is counted as remaining, not failed.
+    private static func testCancelInsideFile() throws {
+        let root = tempRoot("cancelfile")
+        let trash = root.appendingPathComponent("Trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+        let big = trash.appendingPathComponent("big.bin")
+        try Data(count: 64 * 1024 * 1024).write(to: big)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let cancel = CancelFlag()
+        let request = WipeRequest(
+            roots: [trash],
+            level: .gutmann,
+            respectSSD: false,
+            probe: FixedVolumeProbe(solidState: false),
+            inspector: quietInspector
+        )
+        let result = WipeRunner.run(request, cancel: cancel) { snapshot in
+            if snapshot.bytesDone > 0 { cancel.cancel() }
+        }
+        try expect(result.outcome == .cancelled, "cancelled: \(result.outcome)")
+        try expect(result.failures.isEmpty, "not a failure: \(result.failures)")
+        try expect(result.remainingCount == 1, "remaining \(result.remainingCount)")
+        try expect(FileManager.default.fileExists(atPath: big.path), "file stays in Trash")
+    }
+
+    /// Dropped items: disks, the home folder, Trash itself and GoAway are
+    /// refused; the rest moves into Trash and only that is erased.
+    private static func testSelectedItems() throws {
+        let fm = FileManager.default
+        let root = tempRoot("selected")
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let trash = home.appendingPathComponent(".Trash", isDirectory: true)
+        let docs = home.appendingPathComponent("Documents", isDirectory: true)
+        let folder = docs.appendingPathComponent("Folder", isDirectory: true)
+        let app = root.appendingPathComponent("GoAway.app", isDirectory: true)
+        for dir in [trash, folder, app] {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        defer { try? fm.removeItem(at: root) }
+
+        let keep = trash.appendingPathComponent("keep.txt")
+        let alreadyInTrash = trash.appendingPathComponent("already.txt")
+        let secret = docs.appendingPathComponent("secret.txt")
+        let locked = docs.appendingPathComponent("locked.txt")
+        for url in [keep, alreadyInTrash, secret, locked, folder.appendingPathComponent("inner.txt")] {
+            try Data("x".utf8).write(to: url)
+        }
+
+        func refusal(_ url: URL) -> SelectedItems.Refusal? {
+            SelectedItems.refusal(for: url, trashRoots: [trash], home: home, app: app)
+        }
+        try expect(refusal(URL(fileURLWithPath: "/")) == .volume, "disk refused")
+        try expect(refusal(home) == .home, "home refused")
+        try expect(refusal(root) == .home, "home's parent refused")
+        try expect(refusal(trash) == .trash, "Trash refused")
+        try expect(refusal(app) == .goAway, "GoAway refused")
+        try expect(refusal(docs.appendingPathComponent("gone.txt")) == .missing, "missing refused")
+        try expect(refusal(secret) == nil, "file accepted")
+        try expect(refusal(alreadyInTrash) == nil, "item in Trash accepted")
+
+        var moved: [String] = []
+        let prepared = SelectedItems.prepare(
+            [secret, folder, alreadyInTrash, home, locked],
+            trashRoots: [trash], home: home, app: app,
+            moveToTrash: { url in
+                if url.lastPathComponent == "locked.txt" { throw CocoaError(.fileWriteNoPermission) }
+                let target = trash.appendingPathComponent(url.lastPathComponent)
+                try fm.moveItem(at: url, to: target)
+                moved.append(url.lastPathComponent)
+                return target
+            }
+        )
+        try expect(moved == ["secret.txt", "Folder"], "moved \(moved)")
+        let names = Set(prepared.items.map(\.url.lastPathComponent))
+        try expect(names == ["secret.txt", "Folder", "inner.txt", "already.txt"], "items \(names)")
+        try expect(prepared.roots.map(PathGuard.normalize) == [PathGuard.normalize(trash)], "roots \(prepared.roots)")
+        try expect(prepared.failures.map(\.path) == [home.path, locked.path], "failures \(prepared.failures)")
+        try expect(prepared.failures.last?.message.hasPrefix("Could not move to Trash") == true, "move failure message")
+
+        let request = WipeRequest(
+            roots: prepared.roots,
+            level: .simple,
+            respectSSD: true,
+            probe: FixedVolumeProbe(solidState: true),
+            inspector: quietInspector
+        )
+        let result = WipeRunner.run(items: prepared.items, request: request, cancel: CancelFlag()) { _ in }
+        try expect(result.failures.isEmpty, "selection erased: \(result.failures)")
+        let left = try fm.contentsOfDirectory(atPath: trash.path)
+        try expect(left == ["keep.txt"], "rest of Trash untouched: \(left)")
+        try expect(fm.fileExists(atPath: locked.path), "failed move leaves the original")
+    }
+
+    /// Lanes: a parallel set for each SSD, one lane per hard drive, all at once.
+    private static func testWorkLanes() throws {
+        let ssd = VolumeClass(mountPoint: "/", filesystem: "apfs", isSolidState: true, isNetwork: false)
+        let hdd = VolumeClass(mountPoint: "/Volumes/HDD", filesystem: "hfs", isSolidState: false, isNetwork: false)
+        let volumes = Array(repeating: ssd, count: 10) + Array(repeating: hdd, count: 10)
+        let lanes = WipeRunner.laneCounts(for: Array(volumes.indices), volumes: volumes)
+        let cores = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        try expect(lanes["/"] == min(WipeRunner.maxWorkers, cores), "ssd lanes \(lanes)")
+        try expect(lanes["/Volumes/HDD"] == 1, "hdd lanes \(lanes)")
+        try expect(WipeRunner.passLabel(for: [ssd, hdd], request: WipeRequest(roots: [], level: .dod, respectSSD: true)) == "mixed passes", "mixed label")
+        try expect(WipeRunner.passLabel(for: [ssd], request: WipeRequest(roots: [], level: .dod, respectSSD: true)) == "1 pass (SSD)", "ssd label")
+    }
+
+    /// The startup and home volumes keep at least 2 GB (or 2%) free; others 256 MB.
+    private static func testScrubHeadroom() throws {
+        let gb: Int64 = 1024 * 1024 * 1024
+        let startup = VolumeClass(mountPoint: "/", filesystem: "apfs", isSolidState: true, isNetwork: false)
+        let data = VolumeClass(mountPoint: "/System/Volumes/Data", filesystem: "apfs", isSolidState: true, isNetwork: false)
+        let external = VolumeClass(mountPoint: "/Volumes/Backup", filesystem: "hfs", isSolidState: false, isNetwork: false)
+        let homeDisk = VolumeClass(mountPoint: "/Volumes/Home", filesystem: "apfs", isSolidState: true, isNetwork: false)
+        let home = "/Users/someone"
+
+        try expect(FreeSpaceScrubber.headroom(for: startup, capacity: 50 * gb, homePath: home) == 2 * gb, "small startup floor")
+        try expect(FreeSpaceScrubber.headroom(for: data, capacity: 1000 * gb, homePath: home) == 20 * gb, "2% of large data volume")
+        try expect(FreeSpaceScrubber.headroom(for: external, capacity: 1000 * gb, homePath: home) == FreeSpaceScrubber.defaultHeadroom, "external")
+        try expect(FreeSpaceScrubber.headroom(for: homeDisk, capacity: 500 * gb, homePath: "/Volumes/Home/someone") == 10 * gb, "home volume")
+    }
+
+    /// Failure kinds come from the errno captured at the failing call.
+    private static func testStoredErrno() throws {
+        errno = 0
+        try expect(FailureKind.classify(SecureEraserError.openFailed("/x", errno: EACCES)) == .permission, "stored EACCES")
+        try expect(FailureKind.classify(SecureEraserError.writeFailed("/x", errno: EBUSY)) == .busy, "stored EBUSY")
+        errno = EACCES
+        try expect(FailureKind.classify(SecureEraserError.removeFailed("/x", errno: ENOTEMPTY)) == .other, "ignores global errno")
     }
 
     private static func testFailureKinds() throws {
@@ -407,18 +621,20 @@ enum GoAwayCheck {
 
     private static func testAssuranceWarnings() throws {
         let home = VolumeClass(mountPoint: "/", name: "Macintosh HD", filesystem: "apfs", isSolidState: true, isNetwork: false)
-        let clean = VolumeAssurance(volume: home, inPlaceOverwrite: false, freeSpaceScrubbed: true, fileVaultOn: true)
+        try expect(home.inPlaceOverwrite, "apfs overwrites in place")
+        let clean = VolumeAssurance(volume: home, inPlaceOverwrite: home.inPlaceOverwrite, freeSpaceScrubbed: true, fileVaultOn: true)
         try expect(clean.warnings.isEmpty && clean.isClean, "clean")
-        try expect(clean.summary.contains("free space scrubbed") && clean.summary.contains("FileVault on"), "summary \(clean.summary)")
+        try expect(clean.summary == "overwritten in place, free space scrubbed, FileVault on", "summary \(clean.summary)")
 
         let risky = VolumeAssurance(
             volume: home,
-            inPlaceOverwrite: false,
+            inPlaceOverwrite: home.inPlaceOverwrite,
             freeSpaceScrubbed: false,
             localSnapshots: ["2026-10-07-091500", "2026-10-07-101500"],
             timeMachineConfigured: true,
             fileVaultOn: false
         )
+        try expect(risky.summary.hasPrefix("overwritten; snapshots keep older copies"), "snapshot summary \(risky.summary)")
         try expect(risky.warnings.contains(.localSnapshots(count: 2, mountPoint: "/")), "snapshot warning")
         try expect(risky.warnings.contains(.fileVaultOff), "filevault warning")
         try expect(risky.warnings.contains(.timeMachineConfigured), "tm info")
@@ -429,6 +645,10 @@ enum GoAwayCheck {
         let hfs = VolumeAssurance(volume: external, inPlaceOverwrite: external.inPlaceOverwrite, freeSpaceScrubbed: false, fileVaultOn: false)
         try expect(hfs.inPlaceOverwrite, "hfs in place")
         try expect(!hfs.warnings.contains(.fileVaultOff), "filevault only for home volume")
+
+        let share = VolumeClass(mountPoint: "/Volumes/Share", filesystem: "smbfs", isSolidState: false, isNetwork: true)
+        let network = VolumeAssurance(volume: share, inPlaceOverwrite: share.inPlaceOverwrite, freeSpaceScrubbed: false)
+        try expect(!share.inPlaceOverwrite && network.summary == "unlinked only (network volume)", "network \(network.summary)")
     }
 
     private static func testSortedForErase() throws {
@@ -488,22 +708,37 @@ enum GoAwayCheck {
         let afterCancel = try FileManager.default.contentsOfDirectory(atPath: trash.path).filter { $0.hasPrefix(".goaway-scrub") }
         try expect(afterCancel.isEmpty, "no leftovers after cancel")
 
-        // Whole pipeline with scrub enabled reports it in the assurance.
+        // Whole pipeline with scrub enabled reports it in the assurance, and
+        // lists snapshots before the scrub starts.
+        let order = OrderLog()
         let request = WipeRequest(
             roots: [trash],
             level: .simple,
             respectSSD: true,
             scrubFreeSpace: true,
+            scrubHeadroom: headroom,
             probe: FixedVolumeProbe(solidState: true, mountPoint: mount.path),
-            inspector: quietInspector
+            inspector: RecordingInspector(log: order)
         )
         let scrubEmits = Counter()
         let result = WipeRunner.run(request, cancel: CancelFlag()) { snapshot in
-            if snapshot.isScrubbing { scrubEmits.increment() }
+            if snapshot.isScrubbing {
+                scrubEmits.increment()
+                order.append("scrub")
+            }
         }
         try expect(result.outcome == .completed && result.failures.isEmpty, "pipeline with scrub: \(result.failures)")
         try expect(scrubEmits.value > 0, "scrub phase reported")
         try expect(result.assurances.first?.freeSpaceScrubbed == true, "assurance scrubbed")
+        try expect(result.assurances.first.map { $0.scrubbedBytes > 0 } == true, "pipeline scrub wrote data")
+        try expect(order.first == "snapshots", "snapshots listed before scrub: \(order.entries.prefix(3))")
+
+        // Scrub-only pass, as run after snapshots are deleted.
+        let only = WipeRunner.scrubOnly(request, mountPoints: [mount.path], cancel: CancelFlag()) { _ in }
+        try expect(!only.cancelled && only.failures.isEmpty, "scrub-only clean: \(only.failures)")
+        try expect((only.scrubbed[mount.path] ?? 0) > 0, "scrub-only wrote data: \(only.scrubbed)")
+        let skipped = WipeRunner.scrubOnly(request, mountPoints: ["/Volumes/elsewhere"], cancel: CancelFlag()) { _ in }
+        try expect(skipped.scrubbed.isEmpty, "scrub-only respects mount filter")
     }
 
     // MARK: - Helpers
@@ -513,7 +748,23 @@ enum GoAwayCheck {
             .appendingPathComponent("GoAway-\(label)-\(UUID().uuidString)", isDirectory: true)
     }
 
-    private static func shell(_ path: String, _ arguments: [String]) -> Int32 {
+    /// Erased data must not be readable from the raw image. Skipped when hdiutil is unavailable.
+    private static func testForensic() throws {
+        let findings: [Forensic.Finding]
+        do {
+            findings = try Forensic.run()
+        } catch {
+            print("GoAwayCheck: skipping forensic test (\(error))")
+            return
+        }
+        let failed = findings.filter { !$0.passed }
+        if !failed.isEmpty {
+            Forensic.printReport(findings)
+        }
+        try expect(failed.isEmpty, "forensic: \(failed.map { "\($0.filesystem.rawValue) \($0.label)" }.joined(separator: "; "))")
+    }
+
+    static func shell(_ path: String, _ arguments: [String]) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -631,6 +882,37 @@ private final class CountingProbe: VolumeClassifying, @unchecked Sendable {
         lock.unlock()
         return VolumeClass(mountPoint: "/", name: "Counted", filesystem: "apfs", isSolidState: true, isNetwork: false)
     }
+}
+
+private final class OrderLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [String] = []
+
+    func append(_ entry: String) {
+        lock.lock()
+        stored.append(entry)
+        lock.unlock()
+    }
+
+    var entries: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    var first: String? { entries.first }
+}
+
+private struct RecordingInspector: AssuranceInspecting {
+    let log: OrderLog
+
+    func localSnapshots(mountPoint: String) -> [String] {
+        log.append("snapshots")
+        return []
+    }
+
+    func isTimeMachineConfigured() -> Bool { false }
+    func isFileVaultOn() -> Bool? { true }
 }
 
 private struct CheckError: Error, CustomStringConvertible {

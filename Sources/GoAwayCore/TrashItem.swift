@@ -55,8 +55,8 @@ public enum FailureKind: Sendable, Equatable {
         if let eraser = error as? SecureEraserError {
             switch eraser {
             case .outsideTrash: return .outsideTrash
-            case .openFailed, .writeFailed:
-                return classifyErrno(errno)
+            case .openFailed, .writeFailed, .removeFailed:
+                return classifyErrno(eraser.code ?? 0)
             case .cancelled: return .other
             }
         }
@@ -78,7 +78,7 @@ public enum FailureKind: Sendable, Equatable {
         return .other
     }
 
-    private static func classifyErrno(_ code: Int32) -> FailureKind {
+    static func classifyErrno(_ code: Int32) -> FailureKind {
         switch code {
         case EACCES, EPERM, EROFS: return .permission
         case EBUSY, ETXTBSY: return .busy
@@ -193,8 +193,10 @@ public struct WipeRequest: Sendable {
     public var level: WipeLevel
     public var respectSSD: Bool
     /// Fill free space on each affected volume after unlinking. The only way to
-    /// reach freed blocks on APFS from user space.
+    /// reach already-freed blocks from user space.
     public var scrubFreeSpace: Bool
+    /// Free space the scrub leaves on each volume. nil picks a size-scaled default.
+    public var scrubHeadroom: Int64?
     public var probe: any VolumeClassifying
     public var inspector: any AssuranceInspecting
 
@@ -203,6 +205,7 @@ public struct WipeRequest: Sendable {
         level: WipeLevel,
         respectSSD: Bool,
         scrubFreeSpace: Bool = false,
+        scrubHeadroom: Int64? = nil,
         probe: any VolumeClassifying = SystemVolumeProbe(),
         inspector: any AssuranceInspecting = SystemAssuranceInspector()
     ) {
@@ -210,6 +213,7 @@ public struct WipeRequest: Sendable {
         self.level = level
         self.respectSSD = respectSSD
         self.scrubFreeSpace = scrubFreeSpace
+        self.scrubHeadroom = scrubHeadroom
         self.probe = probe
         self.inspector = inspector
     }

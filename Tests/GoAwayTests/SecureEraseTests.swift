@@ -61,7 +61,7 @@ final class SecureEraseTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: nested.appendingPathComponent("note.txt").path))
         XCTAssertEqual(try String(contentsOf: outside, encoding: .utf8), "stay")
         XCTAssertEqual(result.assurances.count, 1)
-        XCTAssertFalse(result.assurances[0].inPlaceOverwrite)
+        XCTAssertTrue(result.assurances[0].inPlaceOverwrite)
         XCTAssertTrue(result.warnings.isEmpty)
 
         let leftover = try FileManager.default.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil)
@@ -205,7 +205,7 @@ final class AssuranceTests: XCTestCase {
         let home = VolumeClass(mountPoint: "/", name: "Macintosh HD", filesystem: "apfs", isSolidState: true, isNetwork: false)
         let risky = VolumeAssurance(
             volume: home,
-            inPlaceOverwrite: false,
+            inPlaceOverwrite: home.inPlaceOverwrite,
             freeSpaceScrubbed: false,
             localSnapshots: ["2026-10-07-091500"],
             timeMachineConfigured: true,
@@ -214,13 +214,17 @@ final class AssuranceTests: XCTestCase {
         XCTAssertTrue(risky.warnings.contains(.localSnapshots(count: 1, mountPoint: "/")))
         XCTAssertTrue(risky.warnings.contains(.fileVaultOff))
         XCTAssertFalse(risky.isClean)
+        XCTAssertTrue(risky.summary.hasPrefix("overwritten; snapshots keep older copies"))
 
-        let clean = VolumeAssurance(volume: home, inPlaceOverwrite: false, freeSpaceScrubbed: true, fileVaultOn: true)
+        let clean = VolumeAssurance(volume: home, inPlaceOverwrite: home.inPlaceOverwrite, freeSpaceScrubbed: true, fileVaultOn: true)
         XCTAssertTrue(clean.isClean)
-        XCTAssertTrue(clean.summary.contains("free space scrubbed"))
+        XCTAssertEqual(clean.summary, "overwritten in place, free space scrubbed, FileVault on")
 
+        XCTAssertTrue(home.inPlaceOverwrite)
         let hfs = VolumeClass(mountPoint: "/Volumes/X", filesystem: "hfs", isSolidState: false, isNetwork: false)
         XCTAssertTrue(hfs.inPlaceOverwrite)
+        let share = VolumeClass(mountPoint: "/Volumes/S", filesystem: "smbfs", isSolidState: false, isNetwork: true)
+        XCTAssertFalse(share.inPlaceOverwrite)
     }
 
     func testFailureKindClassification() {

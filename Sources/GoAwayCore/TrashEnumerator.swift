@@ -93,7 +93,7 @@ public enum TrashEnumerator {
                 )
             } catch {
                 let denial = FullDiskAccess.isPrivacyDenial(error)
-                log.error("Cannot list \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public) privacy=\(denial)")
+                log.error("Cannot list \(url.path, privacy: .private): \(error.localizedDescription, privacy: .private) privacy=\(denial)")
                 unreadable.append(UnreadableDirectory(
                     url: url,
                     message: error.localizedDescription,
@@ -112,7 +112,8 @@ public enum TrashEnumerator {
                 guard guardrail.contains(path) else { continue }
 
                 if guardrail.isRoot(current) {
-                    stack.append(contentsOf: list(current))
+                    // A scrub folder is GoAway's own random data, never something to overwrite.
+                    stack.append(contentsOf: list(current).filter { !FreeSpaceScrubber.isScrubFolder($0) })
                     continue
                 }
 
@@ -126,6 +127,36 @@ public enum TrashEnumerator {
 
         log.info("Scanned \(roots.count) root(s): \(items.count) item(s), \(unreadable.count) unreadable")
         return Report(items: sortedForErase(items), unreadable: unreadable)
+    }
+
+    /// The item at `url` and, for a folder, everything below it. Used to retry
+    /// a folder that could not be removed because it still had contents.
+    public static func collectSubtree(
+        at url: URL,
+        guardrail: PathGuard,
+        fileManager: FileManager = .default
+    ) -> [TrashItem] {
+        if guardrail.isRoot(url) {
+            return collect(roots: [url], fileManager: fileManager)
+        }
+        var items: [TrashItem] = []
+        var visited = Set<String>()
+        var stack = [url]
+        while let current = stack.popLast() {
+            let path = PathGuard.normalize(current)
+            guard visited.insert(path).inserted, guardrail.contains(path) else { continue }
+            guard let item = makeItem(at: current, fileManager: fileManager) else { continue }
+            items.append(item)
+            if item.kind == .directory {
+                let children = try? fileManager.contentsOfDirectory(
+                    at: current,
+                    includingPropertiesForKeys: Array(itemKeys),
+                    options: []
+                )
+                stack.append(contentsOf: children ?? [])
+            }
+        }
+        return sortedForErase(items)
     }
 
     /// Deepest paths first so directories are only removed after their children;

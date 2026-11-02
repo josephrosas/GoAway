@@ -72,12 +72,12 @@ public struct VolumeAssurance: Sendable, Equatable, Identifiable {
     /// One-line summary of how the data was handled on this volume.
     public var summary: String {
         var parts: [String] = []
-        if volume.isNetwork {
+        if volume.isNetwork || !inPlaceOverwrite {
             parts.append("unlinked only (network volume)")
-        } else if inPlaceOverwrite {
-            parts.append("overwritten in place")
+        } else if !localSnapshots.isEmpty {
+            parts.append("overwritten; snapshots keep older copies")
         } else {
-            parts.append("unlinked (APFS is copy-on-write)")
+            parts.append("overwritten in place")
         }
         if freeSpaceScrubbed {
             parts.append("free space scrubbed")

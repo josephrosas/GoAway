@@ -2,17 +2,27 @@ import Darwin
 import Foundation
 
 public enum SecureEraserError: Error, LocalizedError {
-    case openFailed(String)
-    case writeFailed(String)
+    /// The errno is captured at the failing call; the global one is stale by the time anyone reads it.
+    case openFailed(String, errno: Int32)
+    case writeFailed(String, errno: Int32)
+    case removeFailed(String, errno: Int32)
     case outsideTrash(String)
     case cancelled
 
     public var errorDescription: String? {
         switch self {
-        case .openFailed(let path): return "Could not open \(path)"
-        case .writeFailed(let path): return "Could not overwrite \(path)"
+        case .openFailed(let path, let code): return "Could not open \(path): \(String(cString: strerror(code)))"
+        case .writeFailed(let path, let code): return "Could not overwrite \(path): \(String(cString: strerror(code)))"
+        case .removeFailed(let path, let code): return "Could not remove \(path): \(String(cString: strerror(code)))"
         case .outsideTrash(let path): return "Refused to touch \(path)"
         case .cancelled: return "Cancelled"
+        }
+    }
+
+    public var code: Int32? {
+        switch self {
+        case .openFailed(_, let code), .writeFailed(_, let code), .removeFailed(_, let code): return code
+        case .outsideTrash, .cancelled: return nil
         }
     }
 }
@@ -46,17 +56,49 @@ public enum SecureEraser {
     /// Files at or above this size bypass the unified buffer cache.
     public static let noCacheThreshold: Int64 = 16 * 1024 * 1024
 
+    /// Clears the owner-settable locked and append-only flags. The system
+    /// variants need root and are left for the error path to report.
     public static func clearFlags(at path: String) {
         var info = stat()
         guard lstat(path, &info) == 0 else { return }
-        let locked = UInt32(UF_IMMUTABLE) | UInt32(UF_APPEND) | UInt32(SF_IMMUTABLE) | UInt32(SF_APPEND)
-        if info.st_flags & locked != 0 {
-            _ = chflags(path, 0)
+        let userLocks = UInt32(UF_IMMUTABLE) | UInt32(UF_APPEND)
+        if info.st_flags & userLocks != 0 {
+            _ = lchflags(path, info.st_flags & ~userLocks)
         }
-        try? FileManager.default.setAttributes(
-            [.immutable: false, .appendOnly: false],
-            ofItemAtPath: path
-        )
+    }
+
+    /// Makes an item the user owns erasable: owner write on files, owner
+    /// read/write/search on folders, user lock flags off, and every ACL entry
+    /// (such as "deny delete") dropped. Never follows symlinks and never
+    /// touches items owned by someone else. Returns true when anything changed.
+    @discardableResult
+    public static func unlock(at path: String) -> Bool {
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_uid == getuid() else { return false }
+        let type = info.st_mode & S_IFMT
+        guard type == S_IFREG || type == S_IFDIR else { return false }
+
+        var changed = false
+        let userLocks = UInt32(UF_IMMUTABLE) | UInt32(UF_APPEND)
+        if info.st_flags & userLocks != 0, lchflags(path, info.st_flags & ~userLocks) == 0 {
+            changed = true
+        }
+        let wanted: mode_t = type == S_IFDIR ? S_IRWXU : S_IWUSR
+        if info.st_mode & wanted != wanted, lchmod(path, (info.st_mode & 0o7777) | wanted) == 0 {
+            changed = true
+        }
+        if clearACL(at: path) {
+            changed = true
+        }
+        return changed
+    }
+
+    private static func clearACL(at path: String) -> Bool {
+        guard let existing = acl_get_link_np(path, ACL_TYPE_EXTENDED) else { return false }
+        acl_free(UnsafeMutableRawPointer(existing))
+        guard let empty = acl_init(0) else { return false }
+        defer { acl_free(UnsafeMutableRawPointer(empty)) }
+        return acl_set_link_np(path, ACL_TYPE_EXTENDED, empty) == 0
     }
 
     /// Overwrites the file's logical extent once per pass. Large files bypass
@@ -71,7 +113,7 @@ public enum SecureEraser {
         onBytes: ((Int) -> Void)? = nil
     ) throws {
         let fd = open(path, O_WRONLY | O_NOFOLLOW)
-        guard fd >= 0 else { throw SecureEraserError.openFailed(path) }
+        guard fd >= 0 else { throw SecureEraserError.openFailed(path, errno: errno) }
         defer { close(fd) }
 
         var size = lseek(fd, 0, SEEK_END)
@@ -92,7 +134,7 @@ public enum SecureEraser {
         for pass in passes {
             if shouldStop?() == true { throw SecureEraserError.cancelled }
             if lseek(fd, 0, SEEK_SET) < 0 {
-                throw SecureEraserError.writeFailed(path)
+                throw SecureEraserError.writeFailed(path, errno: errno)
             }
 
             // Pattern passes fill the buffer once. Only random data is regenerated per chunk.
@@ -147,29 +189,64 @@ public enum SecureEraser {
         while offset < count {
             let written = write(fd, base + offset, count - offset)
             if written < 0 {
-                if errno == EINTR { continue }
-                throw SecureEraserError.writeFailed(path)
+                let code = errno
+                if code == EINTR { continue }
+                throw SecureEraserError.writeFailed(path, errno: code)
             }
-            if written == 0 { throw SecureEraserError.writeFailed(path) }
+            if written == 0 { throw SecureEraserError.writeFailed(path, errno: EIO) }
             offset += written
         }
     }
 
-    public static func scrambleTruncateUnlink(at url: URL) throws -> URL {
-        let directory = url.deletingLastPathComponent()
-        let scrambled = directory.appendingPathComponent(randomName())
-        do {
-            try FileManager.default.moveItem(at: url, to: scrambled)
-        } catch {
-            try truncateAndUnlink(url)
-            return url
+    /// Renames to a random name, optionally truncates, strips extended
+    /// attributes, then removes the single entry: `unlink` for files and
+    /// symlinks, `rmdir` for folders. Never recursive, so anything left inside
+    /// a folder surfaces as a failure instead of being dropped unerased.
+    ///
+    /// When a step is refused (EACCES/EPERM), `onDenied` gets the current URL
+    /// and one chance to fix permissions; the step is retried if it returns
+    /// true. If removal still fails, the original name is restored so the
+    /// failure points at a path that exists.
+    public static func scrambleAndRemove(
+        at url: URL,
+        isDirectory: Bool,
+        truncate: Bool,
+        onDenied: (URL) -> Bool = { _ in false }
+    ) throws {
+        let scrambled = url.deletingLastPathComponent().appendingPathComponent(randomName())
+        var current = url
+        if attempt(on: url, onDenied: onDenied, { Darwin.rename(url.path, scrambled.path) }) == 0 {
+            current = scrambled
         }
-        try truncateAndUnlink(scrambled)
-        return scrambled
+
+        let path = current.path
+        if truncate && !isDirectory {
+            let fd = open(path, O_WRONLY | O_NOFOLLOW)
+            if fd >= 0 {
+                _ = ftruncate(fd, 0)
+                close(fd)
+            }
+        }
+        removeExtendedAttributes(at: path)
+
+        let code = attempt(on: current, onDenied: onDenied) {
+            isDirectory ? Darwin.rmdir(path) : Darwin.unlink(path)
+        }
+        if code != 0 {
+            if current != url {
+                _ = Darwin.rename(path, url.path)
+            }
+            throw SecureEraserError.removeFailed(url.path, errno: code)
+        }
     }
 
-    public static func unlink(_ url: URL) throws {
-        try FileManager.default.removeItem(at: url)
+    /// Runs a POSIX call that returns 0 on success. On EACCES/EPERM, retries
+    /// once if `onDenied` changed something. Returns 0 or the final errno.
+    private static func attempt(on url: URL, onDenied: (URL) -> Bool, _ call: () -> Int32) -> Int32 {
+        if call() == 0 { return 0 }
+        let code = errno
+        guard code == EACCES || code == EPERM, onDenied(url) else { return code }
+        return call() == 0 ? 0 : errno
     }
 
     public static func removeExtendedAttributes(at path: String) {
@@ -206,19 +283,7 @@ public enum SecureEraser {
         return fcntl(fd, F_FULLFSYNC) == 0
     }
 
-    private static func truncateAndUnlink(_ url: URL) throws {
-        let path = url.path
-        let fd = open(path, O_WRONLY | O_NOFOLLOW)
-        if fd >= 0 {
-            _ = ftruncate(fd, 0)
-            _ = fsync(fd)
-            close(fd)
-        }
-        removeExtendedAttributes(at: path)
-        try FileManager.default.removeItem(at: url)
-    }
-
-    static func randomName() -> String {
+    public static func randomName() -> String {
         var bytes = [UInt8](repeating: 0, count: 8)
         bytes.withUnsafeMutableBytes { raw in
             if let base = raw.baseAddress {

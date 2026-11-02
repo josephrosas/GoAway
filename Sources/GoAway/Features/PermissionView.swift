@@ -24,7 +24,7 @@ struct PermissionView: View {
             VStack(alignment: .leading, spacing: 8) {
                 step("1", "Open Privacy & Security → Full Disk Access")
                 step("2", "Turn on GoAway. If it is already on, turn it off and on again, or remove it with − and drag this copy back in.")
-                step("3", "Relaunch GoAway")
+                step("3", "GoAway relaunches by itself once access is on. If it does not, click Relaunch.")
             }
 
             if let reason = appModel.permissionReason {
@@ -57,7 +57,7 @@ struct PermissionView: View {
             }
         }
         .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .background(GoAwayTheme.page)
     }
 
